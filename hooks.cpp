@@ -62,59 +62,71 @@ namespace Hooks {
         return 0;
     }
 
-    // BlockSource (veya Dimension) pointer'i genellikle Actor/Player struct'i icinde
-    // 0x300 - 0x3A0 offsetleri arasinda tutulur. Dogru degeri dinamik bulmak icin,
-    // pointer olan (0x100000000 < x < 0x800000000) ilk gecerli offseti dondurur.
-    static uintptr_t FindBlockSourceOffset(uintptr_t localPlayer) {
-        for (uintptr_t off = 0x320; off <= 0x3A0; off += 8) {
+    struct BlockSourceLayout {
+        uintptr_t bsOffset;
+        uintptr_t vecOffset;
+    };
+    static BlockSourceLayout sLayout = {0, 0};
+
+    // Dinamik olarak hem BlockSource offsetini hem de icindeki BlockEntity vector offsetini bulur.
+    static BlockSourceLayout FindBlockSourceLayout(uintptr_t localPlayer) {
+        // Player objesi icindeki 0x320-0x3C0 araligini tara (Region/Dimension pointer'lari buradadir)
+        for (uintptr_t off = 0x320; off <= 0x3C0; off += 8) {
             uintptr_t candidate = SDK::SafeRead<uintptr_t>(localPlayer + off);
-            
-            // 1. Is it a valid pointer in memory?
-            if (SDK::IsValidPtr(candidate)) {
-                // 2. BlockSource struct's first element is usually a vtable pointer.
-                // Let's check if the vtable pointer is valid and points to the __DATA_CONST or __TEXT segment.
-                // A simpler check for now: Is it just a valid pointer?
-                uintptr_t possibleVtable = SDK::SafeRead<uintptr_t>(candidate);
-                if (SDK::IsValidPtr(possibleVtable)) {
-                     printf("[yt] BlockSource* candidate @ LocalPlayer+0x%llX = 0x%llX\n", (unsigned long long)off, (unsigned long long)candidate);
-                     // We will return the first highly probable one. In newer versions, it's often 0x360 or 0x368.
-                     // But if we're scanning dynamically, let's just use it.
-                     return off;
+            if (!SDK::IsValidPtr(candidate)) continue;
+
+            // Aday pointer'in (BlockSource?) icindeki 0x30-0x70 araligindaki std::vector'leri tara
+            for (uintptr_t vecOff = 0x30; vecOff <= 0x70; vecOff += 8) {
+                uintptr_t vecBegin = SDK::SafeRead<uintptr_t>(candidate + vecOff);
+                uintptr_t vecEnd   = SDK::SafeRead<uintptr_t>(candidate + vecOff + 8);
+                uintptr_t vecCap   = SDK::SafeRead<uintptr_t>(candidate + vecOff + 16);
+
+                // std::vector bellek yapisi: [begin] <= [end] <= [capacity]
+                if (vecBegin != 0 && vecEnd >= vecBegin && vecCap >= vecEnd) {
+                    if (SDK::IsValidPtr(vecBegin)) {
+                        size_t count = (vecEnd - vecBegin) / 8;
+                        // Sandiklar/Esyalar genelde 0-5000 arasidir. Cok buyukse coptur.
+                        if (count > 0 && count < 10000) {
+                            // Onumuzde Ender Chest oldugu icin liste kesinlikle 0'dan buyuk olmali!
+                            printf("[yt] ✓ BULUNDU! BlockSource offset: 0x%lX, Vector offset: 0x%lX (Kutu sayisi: %zu)\n", 
+                                   (unsigned long)off, (unsigned long)vecOff, count);
+                            return {off, vecOff};
+                        }
+                    }
                 }
             }
         }
-        // Fallback
-        return SDK::kBlockSourceOffset;
+        return {0, 0};
     }
 
     void ProcessContainerScanning(SDK::Player* /*unused*/) {
         uintptr_t base = Memory::GetBaseAddress();
 
-        // 1. Read ClientInstance* from global data slot
+        // 1. Global slot'tan ClientInstance oku
         uintptr_t clientInstance = SDK::GetClientInstance(base);
         if (!SDK::IsValidPtr(clientInstance)) {
             gTickAddressResolved = 0xDEAD;
             return;
         }
 
-        // 2. Auto-calibrate LocalPlayer* offset inside ClientInstance (cached after first find)
-        if (sCalibratedOffset == 0) {
+        // 2. Otomatik kalibrasyon (LocalPlayer)
+        if (sCalibratedOffset == 0)
             sCalibratedOffset = FindLocalPlayerOffset(clientInstance);
-        }
+
         if (sCalibratedOffset == 0) {
-            gTickAddressResolved = 0xBEEF; // Not in world yet
+            gTickAddressResolved = 0xBEEF;
             return;
         }
+
         uintptr_t localPlayer = SDK::SafeRead<uintptr_t>(clientInstance + sCalibratedOffset);
         if (!SDK::IsValidPtr(localPlayer)) {
-            sCalibratedOffset = 0; // Reset – player left, re-calibrate on next world join
+            sCalibratedOffset = 0; 
             gTickAddressResolved = 0xDEAD;
             return;
         }
 
-        // Update global player ptr for position reads in overlay
         gLocalPlayer = (SDK::Player*)localPlayer;
-        gTickAddressResolved = sCalibratedOffset; // Non-zero = HOOKED in GUI
+        gTickAddressResolved = sCalibratedOffset; 
 
         if (!storageEspEnabled) {
             std::lock_guard<std::mutex> lock(containerMutex);
@@ -123,25 +135,43 @@ namespace Hooks {
             return;
         }
 
-        // 3. BlockSource -> BlockEntity listesi tara
-        static uintptr_t sBlockSourceOffset = 0;
-        if (sBlockSourceOffset == 0) {
-            sBlockSourceOffset = FindBlockSourceOffset(localPlayer);
+        // 3. BlockSource ve Vector kalibrasyonu
+        if (sLayout.bsOffset == 0) {
+            sLayout = FindBlockSourceLayout(localPlayer);
         }
         
-        uintptr_t blockSource = SDK::SafeRead<uintptr_t>(localPlayer + sBlockSourceOffset);
-        gDebugBlockSource = blockSource;
-        if (!SDK::IsValidPtr(blockSource)) {
-            sBlockSourceOffset = 0; // Reset on failure
+        if (sLayout.bsOffset == 0) {
+            // Eger 0 ise henuz etrafinda hic chest vs yok veya bulamadi demektir.
             return;
         }
 
-        SDK::BlockSource* region = (SDK::BlockSource*)blockSource;
-        SDK::Vector3 playerPos = SDK::GetPlayerPosition(localPlayer);
-        auto entities = region->getBlockEntities();
+        uintptr_t blockSource = SDK::SafeRead<uintptr_t>(localPlayer + sLayout.bsOffset);
+        gDebugBlockSource = sLayout.bsOffset; // Ekrana buldugu ofseti yazdir (0x358 veya 0x368 gibi kisa offset)
         
-        gDebugListSize = (int)entities.size();
+        if (!SDK::IsValidPtr(blockSource)) {
+            sLayout = {0, 0}; // Baglanti koparsa tekrar tara
+            return;
+        }
 
+        // Vector okuma islemi
+        uintptr_t vecBegin = SDK::SafeRead<uintptr_t>(blockSource + sLayout.vecOffset);
+        uintptr_t vecEnd   = SDK::SafeRead<uintptr_t>(blockSource + sLayout.vecOffset + 8);
+        
+        size_t count = 0;
+        if (vecEnd >= vecBegin && SDK::IsValidPtr(vecBegin)) {
+            count = (vecEnd - vecBegin) / 8;
+        }
+        if (count > 2000) count = 2000;
+        
+        gDebugListSize = (int)count;
+
+        std::vector<SDK::BlockEntity*> entities;
+        for (size_t i = 0; i < count; i++) {
+            SDK::BlockEntity* be = SDK::SafeRead<SDK::BlockEntity*>(vecBegin + i * 8);
+            if (be) entities.push_back(be);
+        }
+
+        SDK::Vector3 playerPos = SDK::GetPlayerPosition(localPlayer);
         std::vector<MappedContainer> temp;
         for (auto* be : entities) {
             if (!be) continue;
