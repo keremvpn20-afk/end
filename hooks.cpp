@@ -1,0 +1,149 @@
+#include "hooks.hpp"
+#include "sdk.hpp"
+#include "memory.hpp"
+#include <mutex>
+
+namespace Hooks {
+
+    bool storageEspEnabled = false;
+    bool filterChest       = true;
+    bool filterEnderChest  = true;
+    bool filterShulker     = true;
+    bool filterHopper      = true;
+    bool filterSpawner     = true;
+    bool filterBarrel      = true;
+    bool drawTracers       = false;
+
+    std::vector<MappedContainer> detectedContainers;
+    std::mutex containerMutex;
+
+    // Not used for hooking anymore - just updated by scanner
+    SDK::Player* gLocalPlayer = nullptr;
+
+    // gTickAddressResolved meanings:
+    //   0           = scanner never ran
+    //   0xA608634   = scanner ran, ClientInstance found
+    //   0xDEAD      = scanner ran, ClientInstance NOT found (wrong offsets or not in world)
+    uintptr_t gTickAddressResolved = 0;
+    int gScannedEntitiesCount = 0;
+    uintptr_t gDebugBlockSource = 0;
+    int gDebugListSize = 0;
+
+    // ── Auto-calibrated LocalPlayer offset ───────────────────────────────────
+    // We don't know the exact offset of LocalPlayer* inside ClientInstance for v1.26.33.
+    // So we probe every 8 bytes from 0x180 to 0x280, read the candidate pointer,
+    // then read what would be the Actor position (at +0x4C0).
+    // A valid player position has: x != 0, y in [-64, 320], z != 0.
+    // The first match is cached and reused on subsequent frames.
+    static uintptr_t sCalibratedOffset = 0; // 0 = not yet found
+
+    static uintptr_t FindLocalPlayerOffset(uintptr_t clientInstance) {
+        // Binary disassembly shows heavy activity at ClientInstance+0x200/0x208/0x210.
+        // We probe 0x150 → 0x280 in 8-byte steps and validate against world coords.
+        for (uintptr_t off = 0x150; off <= 0x280; off += 8) {
+            uintptr_t candidate = SDK::SafeRead<uintptr_t>(clientInstance + off);
+            if (!SDK::IsValidPtr(candidate)) continue;
+
+            // Read position at Actor::pos (offset 0x4C0 in Player)
+            float posX = SDK::SafeRead<float>(candidate + 0x4C0 + 0);
+            float posY = SDK::SafeRead<float>(candidate + 0x4C0 + 4);
+            float posZ = SDK::SafeRead<float>(candidate + 0x4C0 + 8);
+
+            // Strict Minecraft world bounds: y in [-64,320], x/z in ±30M, non-zero
+            if (posY > -64.f && posY < 320.f &&
+                posX > -30000000.f && posX < 30000000.f &&
+                posZ > -30000000.f && posZ < 30000000.f &&
+                (posX != 0.f || posZ != 0.f)) {
+                printf("[yt] ✓ LocalPlayer* @ ClientInstance+0x%llX (%.1f, %.1f, %.1f)\n",
+                       (unsigned long long)off, posX, posY, posZ);
+                return off;
+            }
+        }
+        return 0;
+    }
+
+    void ProcessContainerScanning(SDK::Player* /*unused*/) {
+        uintptr_t base = Memory::GetBaseAddress();
+
+        // 1. Read ClientInstance* from global data slot
+        uintptr_t clientInstance = SDK::GetClientInstance(base);
+        if (!SDK::IsValidPtr(clientInstance)) {
+            gTickAddressResolved = 0xDEAD;
+            return;
+        }
+
+        // 2. Auto-calibrate LocalPlayer* offset inside ClientInstance (cached after first find)
+        if (sCalibratedOffset == 0) {
+            sCalibratedOffset = FindLocalPlayerOffset(clientInstance);
+        }
+        if (sCalibratedOffset == 0) {
+            gTickAddressResolved = 0xBEEF; // Not in world yet
+            return;
+        }
+        uintptr_t localPlayer = SDK::SafeRead<uintptr_t>(clientInstance + sCalibratedOffset);
+        if (!SDK::IsValidPtr(localPlayer)) {
+            sCalibratedOffset = 0; // Reset – player left, re-calibrate on next world join
+            gTickAddressResolved = 0xDEAD;
+            return;
+        }
+
+        // Update global player ptr for position reads in overlay
+        gLocalPlayer = (SDK::Player*)localPlayer;
+        gTickAddressResolved = sCalibratedOffset; // Non-zero = HOOKED in GUI
+
+        if (!storageEspEnabled) {
+            std::lock_guard<std::mutex> lock(containerMutex);
+            detectedContainers.clear();
+            gScannedEntitiesCount = 0;
+            return;
+        }
+
+        // 3. BlockSource -> BlockEntity listesi tara
+        uintptr_t blockSource = SDK::GetBlockSource(localPlayer);
+        gDebugBlockSource = blockSource;
+        if (!SDK::IsValidPtr(blockSource)) return;
+
+        SDK::BlockSource* region = (SDK::BlockSource*)blockSource;
+        SDK::Vector3 playerPos = SDK::GetPlayerPosition(localPlayer);
+        auto entities = region->getBlockEntities();
+        
+        gDebugListSize = (int)entities.size();
+
+        std::vector<MappedContainer> temp;
+        for (auto* be : entities) {
+            if (!be) continue;
+            SDK::Vector3 pos = be->getPosition();
+            if (pos.y < -64.f || pos.y > 320.f) continue;
+            float dist = playerPos.distance(pos);
+            if (dist > 100.f) continue;
+
+            int rawType = be->getType();
+            int mappedType = -1;
+            if      (rawType == 1  && filterChest)      mappedType = 1;
+            else if (rawType == 2  && filterEnderChest) mappedType = 2;
+            else if (rawType == 8  && filterHopper)     mappedType = 3;
+            else if (rawType == 6  && filterSpawner)    mappedType = 4;
+            else if (rawType == 10 && filterShulker)    mappedType = 5;
+            else if (rawType == 15 && filterBarrel)     mappedType = 6;
+
+            if (mappedType != -1)
+                temp.push_back({ mappedType, pos, dist });
+        }
+
+        std::lock_guard<std::mutex> lock(containerMutex);
+        gScannedEntitiesCount = (int)temp.size();
+        detectedContainers = std::move(temp);
+    }
+
+    // ── No-op stubs (hooks removed, everything is read-only now) ────────────
+    void Initialize() {
+        // Nothing to hook. Scanner runs from overlay every frame.
+        // Pre-warm: do one immediate scan to check if ClientInstance is accessible
+        ProcessContainerScanning(nullptr);
+        printf("[yt] Hook-free mode. ClientInstance global @ base+0x%llx. Status: %s\n",
+               (unsigned long long)SDK::kClientInstancePtrOffset,
+               (gTickAddressResolved == 0xA608634) ? "OK" : "NOT FOUND YET");
+    }
+
+    void Terminate() {}
+}
