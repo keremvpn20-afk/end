@@ -135,82 +135,95 @@ namespace Hooks {
             return;
         }
 
-        // 3. Brute-force "Heap-like" Memory Scanning (YENI YONTEM!)
-        // Madem oyun bize BlockSource'u veya sandik listesini vermiyor,
-        // biz de kendimiz buluruz! BlockEntity objelerinin TypeID'si +0x24'te,
-        // Pozisyonlari ise +0x2C'dedir (x,y,z float).
-        // Hafizada sadece player'in yakinlarindaki adresleri tarayip bu "imzaya" uyan
-        // sandiklari kendi listemize alacagiz.
-
-        std::vector<MappedContainer> temp;
-        SDK::Vector3 playerPos = SDK::GetPlayerPosition(localPlayer);
+        // 3. PAGE-BY-PAGE SAFE HEAP SCANNER (YENI VE EN GUVENLI YONTEM!)
+        // iOS Kernel (mach_vm_read) kullanarak cok guvenli bir tarama yapacagiz.
+        // Asla crash vermez, cunku sadece kernel tarafindan onaylanmis, okunabilir RAM sayfalari (page) taranir.
+        // Ayrica Minecraft'ta pozisyonlar (BlockPos) float degil, INT (Tam Sayi) olarak tutulur!
+        // Eski kod bu yuzden degerleri sacma sapan floatlara cevirip bulamiyordu.
         
-        // Eger player pozisyonu bozuksa tarama yapma
-        if (playerPos.y < -64.f || playerPos.y > 320.f) {
-            sCalibratedOffset = 0; // Player offset'i bozulmus, resetle
-            return;
-        }
-
-        // Taramayi kucultmek icin: sadece gecerli BlockEntity tiplerini ariyoruz.
-        // Chest = 1, EnderChest = 2, Hopper = 8, Spawner = 6, Shulker = 10, Barrel = 15
-
-        // Minecraft objeleri genellikle LocalPlayer'in bulundugu heap bolgesi etrafindadir.
-        // localPlayer adresinden 2 MB oncesi ve 2 MB sonrasi gibi guvenli bir alani tarayalim (Kasma yapmamasi icin)
-        // Her render karesinde (saniyede 60 kere) sifir gecikmeyle taranir.
+        static auto lastScanTime = std::chrono::steady_clock::now();
+        auto now = std::chrono::steady_clock::now();
         
-        uintptr_t scanStart = (localPlayer & ~0xFFFFFF) - 0x200000; // 2MB gerisi
-        uintptr_t scanEnd   = (localPlayer & ~0xFFFFFF) + 0x200000; // 2MB ilerisi
-
-        for (uintptr_t ptr = scanStart; ptr < scanEnd; ptr += 8) {
-            // Hizli on kontrol: +0x24 bir gecerli tip mi? (1, 2, 6, 8, 10, 15)
-            // Not: Gecerli olmayan veya bos bellekte crash onlemek icin try-catch bloklari kullanilmaz, 
-            // iOS'ta memory mapping nedeniyle hata almamak icin kucuk guvenli bir alan taranir.
+        // Listeyi saniyede 1 kere yenile (Ekrandaki cizimler saniyede 60 kere güncellenir, sadece liste yenilemesi 1 sn)
+        if (std::chrono::duration_cast<std::chrono::milliseconds>(now - lastScanTime).count() > 1000) {
+            lastScanTime = now;
             
-            int type = 0;
-            // Eger gecerli bir bellek adresiyse oku
-            if (SDK::IsValidPtr(ptr)) {
-                type = SDK::SafeRead<int>(ptr + 0x24);
+            std::vector<MappedContainer> temp;
+            SDK::Vector3 playerPos = SDK::GetPlayerPosition(localPlayer);
+            
+            if (playerPos.y < -64.f || playerPos.y > 320.f) {
+                sCalibratedOffset = 0; 
+                return;
             }
 
-            if (type == 1 || type == 2 || type == 6 || type == 8 || type == 10 || type == 15) {
-                
-                // Pozisyonu kontrol et (x,y,z float degerleri +0x2C'de mi?)
-                float px = SDK::SafeRead<float>(ptr + 0x2C + 0);
-                float py = SDK::SafeRead<float>(ptr + 0x2C + 4);
-                float pz = SDK::SafeRead<float>(ptr + 0x2C + 8);
-                
-                if (py > -64.f && py < 320.f && 
-                    px > -30000000.f && px < 30000000.f && 
-                    pz > -30000000.f && pz < 30000000.f &&
-                    (px != 0.f || pz != 0.f)) {
-                    
-                    // Bu gercekten bir BlockEntity'ye benziyor!
-                    // Mesafeyi kontrol et
-                    SDK::Vector3 pos = {px, py, pz};
-                    float dist = playerPos.distance(pos);
-                    if (dist < 100.f) { // 100 metreden yakin
-                        
-                        int mapped = -1;
-                        if      (type == 1  && filterChest)      mapped = 1;
-                        else if (type == 2  && filterEnderChest) mapped = 2;
-                        else if (type == 8  && filterHopper)     mapped = 3;
-                        else if (type == 6  && filterSpawner)    mapped = 4;
-                        else if (type == 10 && filterShulker)    mapped = 5;
-                        else if (type == 15 && filterBarrel)     mapped = 6;
+            int pX = (int)std::floor(playerPos.x);
+            int pY = (int)std::floor(playerPos.y);
+            int pZ = (int)std::floor(playerPos.z);
 
-                        if (mapped != -1) {
-                            temp.push_back({ mapped, pos, dist });
+            // 16 MB tarama alani (8 MB gerisi, 8 MB ilerisi)
+            uintptr_t scanRadius = 0x800000;
+            // iOS bellek sayfalari 16KB'dir (0x4000). Player adresini en yakin 16KB baslangicina yuvarla
+            uintptr_t scanStart = (localPlayer & ~0x3FFFULL) - scanRadius; 
+            uintptr_t scanEnd   = (localPlayer & ~0x3FFFULL) + scanRadius;
+
+            // 16KB gecici tampon bellek
+            uint8_t pageBuf[0x4000];
+            vm_size_t pageSize = 0x4000;
+
+            for (uintptr_t page = scanStart; page < scanEnd; page += pageSize) {
+                vm_size_t readCount = pageSize;
+                
+                // KERNEL'e sor: "Bu 16KB'lik bellek okunabilir mi?" Okunabilirse pageBuf'a kopyala.
+                if (vm_read_overwrite(mach_task_self(), (vm_address_t)page, pageSize, (vm_address_t)pageBuf, &readCount) == KERN_SUCCESS) {
+                    
+                    // 16KB icinde 8'er byte atlayarak tara
+                    for (uintptr_t offset = 0; offset < pageSize - 0x40; offset += 8) {
+                        
+                        // +0x24: BlockEntityType (int)
+                        int type = *(int*)(pageBuf + offset + 0x24);
+                        if (type == 1 || type == 2 || type == 6 || type == 8 || type == 10 || type == 15) {
+                            
+                            // +0x2C: BlockPos (int x, int y, int z) -> Minecraft sandik pozisyonlarini INT tutar!
+                            int bx = *(int*)(pageBuf + offset + 0x2C + 0);
+                            int by = *(int*)(pageBuf + offset + 0x2C + 4);
+                            int bz = *(int*)(pageBuf + offset + 0x2C + 8);
+                            
+                            if (by > -64 && by < 320) {
+                                int dx = std::abs(bx - pX);
+                                int dy = std::abs(by - pY);
+                                int dz = std::abs(bz - pZ);
+                                
+                                // Eger sandik oyuncuya 100 bloktan yakinsa (abs = mutlak deger)
+                                if (dx < 100 && dy < 100 && dz < 100) {
+                                    
+                                    // Ekrana cizerken kutunun merkezine oturmasi icin +0.5 ekliyoruz
+                                    SDK::Vector3 pos = {(float)bx + 0.5f, (float)by + 0.5f, (float)bz + 0.5f};
+                                    float dist = playerPos.distance(pos);
+                                    
+                                    int mapped = -1;
+                                    if      (type == 1  && filterChest)      mapped = 1;
+                                    else if (type == 2  && filterEnderChest) mapped = 2;
+                                    else if (type == 8  && filterHopper)     mapped = 3;
+                                    else if (type == 6  && filterSpawner)    mapped = 4;
+                                    else if (type == 10 && filterShulker)    mapped = 5;
+                                    else if (type == 15 && filterBarrel)     mapped = 6;
+
+                                    if (mapped != -1) {
+                                        temp.push_back({ mapped, pos, dist });
+                                    }
+                                }
+                            }
                         }
                     }
                 }
             }
+            
+            std::lock_guard<std::mutex> lock(containerMutex);
+            gScannedEntitiesCount = (int)temp.size();
+            detectedContainers = std::move(temp);
+            gDebugBlockSource = 0x7777; // Yepyeni Kernel Scanner isareti
+            gDebugListSize = gScannedEntitiesCount;
         }
-        
-        std::lock_guard<std::mutex> lock(containerMutex);
-        gScannedEntitiesCount = (int)temp.size();
-        detectedContainers = std::move(temp);
-        gDebugBlockSource = 0x9999; // Tarama calisiyor isareti
-        gDebugListSize = gScannedEntitiesCount;
     }
 
     // ── No-op stubs (hooks removed, everything is read-only now) ────────────
