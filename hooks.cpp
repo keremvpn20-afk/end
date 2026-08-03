@@ -62,6 +62,31 @@ namespace Hooks {
         return 0;
     }
 
+    // BlockSource (veya Dimension) pointer'i genellikle Actor/Player struct'i icinde
+    // 0x300 - 0x3A0 offsetleri arasinda tutulur. Dogru degeri dinamik bulmak icin,
+    // pointer olan (0x100000000 < x < 0x800000000) ilk gecerli offseti dondurur.
+    static uintptr_t FindBlockSourceOffset(uintptr_t localPlayer) {
+        for (uintptr_t off = 0x320; off <= 0x3A0; off += 8) {
+            uintptr_t candidate = SDK::SafeRead<uintptr_t>(localPlayer + off);
+            
+            // 1. Is it a valid pointer in memory?
+            if (SDK::IsValidPtr(candidate)) {
+                // 2. BlockSource struct's first element is usually a vtable pointer.
+                // Let's check if the vtable pointer is valid and points to the __DATA_CONST or __TEXT segment.
+                // A simpler check for now: Is it just a valid pointer?
+                uintptr_t possibleVtable = SDK::SafeRead<uintptr_t>(candidate);
+                if (SDK::IsValidPtr(possibleVtable)) {
+                     printf("[yt] BlockSource* candidate @ LocalPlayer+0x%llX = 0x%llX\n", (unsigned long long)off, (unsigned long long)candidate);
+                     // We will return the first highly probable one. In newer versions, it's often 0x360 or 0x368.
+                     // But if we're scanning dynamically, let's just use it.
+                     return off;
+                }
+            }
+        }
+        // Fallback
+        return SDK::kBlockSourceOffset;
+    }
+
     void ProcessContainerScanning(SDK::Player* /*unused*/) {
         uintptr_t base = Memory::GetBaseAddress();
 
@@ -99,9 +124,17 @@ namespace Hooks {
         }
 
         // 3. BlockSource -> BlockEntity listesi tara
-        uintptr_t blockSource = SDK::GetBlockSource(localPlayer);
+        static uintptr_t sBlockSourceOffset = 0;
+        if (sBlockSourceOffset == 0) {
+            sBlockSourceOffset = FindBlockSourceOffset(localPlayer);
+        }
+        
+        uintptr_t blockSource = SDK::SafeRead<uintptr_t>(localPlayer + sBlockSourceOffset);
         gDebugBlockSource = blockSource;
-        if (!SDK::IsValidPtr(blockSource)) return;
+        if (!SDK::IsValidPtr(blockSource)) {
+            sBlockSourceOffset = 0; // Reset on failure
+            return;
+        }
 
         SDK::BlockSource* region = (SDK::BlockSource*)blockSource;
         SDK::Vector3 playerPos = SDK::GetPlayerPosition(localPlayer);
